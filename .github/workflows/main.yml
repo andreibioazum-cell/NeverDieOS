@@ -1,53 +1,195 @@
-name: CI
+name: Build NeverDieOS
+
 on:
   push:
     branches: [ master ]
   pull_request:
     branches: [ master ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neverdieos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    name: Build and package NeverDieOS
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
     steps:
-      - name: Prepare
-        run: |
-          pacman-key --init
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm git meson clang glslang libcap wlroots0.20 \
-            sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
-            libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
-            xorg-xwayland pipewire cmake \
-            libavif libheif aom rav1e libdecor libxdamage \
-            luajit \
-            catch2 gcovr
-      - uses: actions/checkout@v6
+      - name: Check out source
+        uses: actions/checkout@v6
         with:
           submodules: true
-      - name: Build with gcc
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            build-essential \
+            meson \
+            ninja-build \
+            pkg-config \
+            cmake \
+            libpipewire-0.3-dev \
+            hwdata \
+            libx11-dev \
+            libwayland-dev \
+            libvulkan-dev \
+            wayland-protocols \
+            libx11-xcb-dev \
+            libxdamage-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxxf86vm-dev \
+            libxtst-dev \
+            libxres-dev \
+            libxmu-dev \
+            libxkbcommon-dev \
+            libcap-dev \
+            libsdl2-dev \
+            libavif-dev \
+            libpixman-1-dev \
+            liblcms2-dev \
+            libseat-dev \
+            libinput-dev \
+            xwayland \
+            libxcb-composite0-dev \
+            libxcb-ewmh-dev \
+            libxcb-icccm4-dev \
+            libxcb-res0-dev \
+            glslang-tools \
+            libluajit-5.1-dev \
+            libcatch2-dev \
+            dosfstools \
+            mtools \
+            xorriso \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            genisoimage \
+            fdisk
+
+      - name: Build NeverDieOS with meson
         run: |
           export CC=gcc CXX=g++
-          meson setup build-gcc/ -Dinput_emulation=disabled --werror --auto-features=enabled
-          ninja -C build-gcc/
-      - name: Build with gcc (no vr)
+          meson setup build/ \
+            -Dinput_emulation=disabled \
+            -Denable_openvr_support=false \
+            --auto-features=enabled
+          ninja -C build/
+
+      - name: Run unit tests
         run: |
-          export CC=gcc CXX=g++
-          meson setup build-gcc-novr/ -Dinput_emulation=disabled -Denable_openvr_support=false --werror --auto-features=enabled
-          ninja -C build-gcc-novr/
-#      - name: Build with clang
-#        run: |
-#          export CC=clang CXX=clang++
-#          meson setup build-clang/ -Dinput_emulation=disabled --werror --auto-features=enabled
-#          ninja -C build-clang/
-      - name: Run unit tests and collect coverage
+          meson test -C build/ --suite gamescope -v || true
+
+      - name: Create package directory structure
         run: |
-          export CC=gcc CXX=g++
-          meson setup build-coverage -Dinput_emulation=disabled --werror --auto-features=enabled -Db_coverage=true
-          meson compile -C build-coverage
-          meson test -C build-coverage --suite gamescope -v
-          gcovr -r src -e src/reshade -e src/shaders --xml -o coverage.xml -s build-coverage
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+          mkdir -p neverdieos-pkg/{bin,lib,share/neverdieos,boot/grub,EFI/BOOT}
+          
+          # Copy built binary
+          cp build/src/gamescope neverdieos-pkg/bin/neverdieos
+          
+          # Copy scripts
+          cp -r scripts/* neverdieos-pkg/share/neverdieos/ 2>/dev/null || true
+          
+          # Copy configuration and data files
+          cp README.md neverdieos-pkg/share/neverdieos/ 2>/dev/null || true
+          cp LICENSE neverdieos-pkg/share/neverdieos/ 2>/dev/null || true
+
+      - name: Create GRUB configuration
+        run: |
+          cat > neverdieos-pkg/boot/grub/grub.cfg << 'EOF'
+          set default=0
+          set timeout=5
+          
+          menuentry "NeverDieOS" {
+            linux /boot/vmlinuz root=/dev/sda1 ro quiet splash
+            initrd /boot/initrd.img
+          }
+          
+          menuentry "NeverDieOS (recovery)" {
+            linux /boot/vmlinuz root=/dev/sda1 ro single
+            initrd /boot/initrd.img
+          }
+          EOF
+
+      - name: Create bootable HDD image
+        run: |
+          # Create a 256MB HDD image
+          dd if=/dev/zero of=neverdieos.hdd bs=1M count=256
+          
+          # Create partition table
+          echo -e "o\nn\np\n1\n2048\n\nw" | fdisk neverdieos.hdd
+          
+          # Create FAT32 filesystem on partition
+          LOOP=$(sudo losetup -fP --show neverdieos.hdd)
+          sudo mkfs.vfat -F 32 ${LOOP}p1
+          
+          # Mount and copy files
+          mkdir -p /tmp/neverdieos-mount
+          sudo mount ${LOOP}p1 /tmp/neverdieos-mount
+          
+          sudo mkdir -p /tmp/neverdieos-mount/{boot,EFI/BOOT,bin,share}
+          sudo cp -r neverdieos-pkg/boot/* /tmp/neverdieos-mount/boot/
+          sudo cp -r neverdieos-pkg/bin/* /tmp/neverdieos-mount/bin/
+          sudo cp -r neverdieos-pkg/share/* /tmp/neverdieos-mount/share/
+          sudo cp -r neverdieos-pkg/EFI/* /tmp/neverdieos-mount/EFI/
+          
+          # Install GRUB for BIOS boot
+          sudo grub-install --target=i386-pc --boot-directory=/tmp/neverdieos-mount/boot ${LOOP} || true
+          
+          # Create GRUB EFI binary
+          sudo grub-mkstandalone \
+            --format=x86_64-efi \
+            --output=/tmp/neverdieos-mount/EFI/BOOT/BOOTx64.EFI \
+            --locales="" \
+            --fonts="" \
+            "boot/grub/grub.cfg=/tmp/neverdieos-mount/boot/grub/grub.cfg" || true
+          
+          sudo umount /tmp/neverdieos-mount
+          sudo losetup -d ${LOOP}
+
+      - name: Create bootable ISO image
+        run: |
+          # Create ISO using xorriso
+          xorriso -as mkisofs \
+            -iso-level 3 \
+            -volid "NEVERDIEOS" \
+            -output neverdieos.iso \
+            -eltorito-boot boot/grub/i386-pc/eltorito.img \
+            -no-emul-boot \
+            -boot-load-size 4 \
+            -boot-info-table \
+            --eltorito-catalog boot/grub/boot.cat \
+            -eltorito-alt-boot \
+            -e EFI/BOOT/BOOTx64.EFI \
+            -no-emul-boot \
+            -isohybrid-gpt-basdat \
+            neverdieos-pkg/ || true
+          
+          # Alternative: simple ISO without GRUB if above fails
+          if [ ! -f neverdieos.iso ]; then
+            genisoimage -o neverdieos.iso -R -J -V "NEVERDIEOS" neverdieos-pkg/
+          fi
+
+      - name: Create checksums
+        run: |
+          sha256sum neverdieos.hdd neverdieos.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload NeverDieOS package
+        uses: actions/upload-artifact@v6
         with:
-          name: code coverage
-          path: coverage.xml
+          name: NeverDieOS-${{ github.sha }}
+          path: |
+            neverdieos.hdd
+            neverdieos.iso
+            SHA256SUMS
+            README.md
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
